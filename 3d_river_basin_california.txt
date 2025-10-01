@@ -1,0 +1,270 @@
+#                3D river basin maps with R for California
+#                 Adapted from Milos Popovic
+#                 2025/09/30
+
+libs <- c(
+    "tidyverse", "sf", "tigris",
+    "elevatr", "terra", "rayshader"
+)
+
+installed_libs <- libs %in% rownames(
+    installed.packages()
+)
+
+if (any(installed_libs == F)) {
+    install.packages(
+        libs[!installed_libs]
+    )
+}
+
+invisible(lapply(
+    libs, library,
+    character.only = T
+))
+
+sf::sf_use_s2(F)
+
+# 1. REGION SF
+#---------------
+
+# Get California state boundaries
+state_sf <- tigris::states(cb = TRUE, resolution = "5m") |>
+    dplyr::filter(STUSPS == "CA") |>
+    sf::st_transform(crs = 4326)
+
+state_bbox <- sf::st_bbox(
+    state_sf
+)
+
+# 2. GET RIVERS
+#--------------
+
+url <- "https://data.hydrosheds.org/file/HydroRIVERS/HydroRIVERS_v10_na_shp.zip"
+
+download.file(
+    url = url,
+    destfile = basename(url),
+    mode = "wb"
+)
+
+unzip(basename(url))
+filename <- list.files(
+    path = "HydroRIVERS_v10_na_shp",
+    pattern = ".shp",
+    full.names = T
+)
+
+print(state_bbox)
+
+bbox_wkt <- "POLYGON((
+    -124.4096 32.5342,
+    -124.4096 42.0095,
+    -114.1312 42.0095,
+    -114.1312 32.5342,
+    -124.4096 32.5342
+))"
+
+state_rivers <- sf::st_read(
+    filename,
+    wkt_filter = bbox_wkt
+)
+
+plot(sf::st_geometry(state_sf), col = "red")
+plot(sf::st_geometry(state_rivers), add = T)
+
+# 3. GET BASINS
+#---------------
+
+url <- "https://data.hydrosheds.org/file/HydroBASINS/standard/hybas_na_lev04_v1c.zip"
+
+download.file(
+    url = url,
+    destfile = basename(url),
+    mode = "wb"
+)
+
+list.files()
+
+unzip(basename(url))
+
+state_basin <- sf::st_read(
+    "hybas_na_lev04_v1c.shp"
+) |>
+    sf::st_intersection(state_sf) |>
+    dplyr::select(HYBAS_ID)
+
+# 4. CLIP RIVERS TO BASINS
+#-------------------------
+
+state_river_basin <- sf::st_intersection(
+    state_rivers,
+    state_basin
+)
+
+unique(state_river_basin$HYBAS_ID)
+
+# Define Lambert projection for California
+crs_lambert <- "+proj=laea +lat_0=37.0 +lon_0=-120.0 +x_0=4321000 +y_0=3210000 +datum=WGS84 +units=m +no_frfs"
+
+# 5. PALETTE
+#-----------
+
+# Get the number of unique basin IDs
+n_basins <- length(unique(state_river_basin$HYBAS_ID))
+
+# Create a palette with enough colors for all basins
+palette <- hcl.colors(
+    n = n_basins,
+    palette = "Dark 3"
+) |>
+    sample()
+
+# Assign the unique HYBAS_IDs as names to the palette
+names(palette) <- unique(state_river_basin$HYBAS_ID)
+
+pal <- as.data.frame(
+    palette
+) |>
+    tibble::rownames_to_column(
+        "HYBAS_ID"
+    ) |>
+    dplyr::mutate(
+        HYBAS_ID = as.numeric(HYBAS_ID)
+    )
+
+state_river_basin_pal <- state_river_basin |>
+    dplyr::left_join(
+        pal,
+        by = "HYBAS_ID"
+    )
+
+state_basin_pal <- sf::st_transform(
+    state_basin,
+    crs = crs_lambert
+) |>
+    dplyr::inner_join(
+        pal,
+        by = "HYBAS_ID"
+    ) |>
+    dplyr::mutate(
+        HYBAS_ID = as.factor(HYBAS_ID)
+    )
+
+# 6. WIDTH
+#----------
+
+unique(state_river_basin_pal$ORD_FLOW)
+
+state_river_width <- state_river_basin_pal |>
+    dplyr::mutate(
+        width = as.numeric(
+            ORD_FLOW
+        ),
+        width = dplyr::case_when(
+            width == 3 ~ 14,
+            width == 4 ~ 12,
+            width == 5 ~ 10,
+            width == 6 ~ 8,
+            width == 7 ~ 7,
+            width == 8 ~ 6,
+            TRUE ~ 0
+        )
+    ) |>
+    sf::st_as_sf() |>
+    sf::st_transform(crs = crs_lambert)
+
+# 7. DEM
+#-------
+
+elevation_raster <- elevatr::get_elev_raster(
+    locations = state_sf,
+    z = 8, clip = "locations"
+) |>
+    terra::rast() |>
+    terra::project(crs_lambert)
+
+elevation_matrix <- rayshader::raster_to_matrix(
+    elevation_raster
+)
+
+# 8. RENDER SCENE
+#----------------
+
+h <- nrow(elevation_raster)
+w <- ncol(elevation_raster)
+
+elevation_matrix |>
+    rayshader::height_shade(
+        texture = colorRampPalette(
+            c(
+                "grey90",
+                "grey60"
+            )
+        )(256)
+    ) |>
+    rayshader::add_overlay(
+        rayshader::generate_polygon_overlay(
+            geometry = state_basin_pal,
+            extent = elevation_raster,
+            heightmap = elevation_matrix,
+            linecolor = palette,
+            palette = palette,
+            data_column_fill = "HYBAS_ID"
+        ), alphalayer = .6 
+    ) |>
+    rayshader::add_overlay(
+        rayshader::generate_line_overlay(
+            geometry = state_river_width,
+            extent = elevation_raster,
+            heightmap = elevation_matrix,
+            color = state_river_width$palette,
+            linewidth = state_river_width$width,
+            data_column_width = "width"
+        ),
+        alphalayer = 1
+    ) |>
+    rayshader::plot_3d(
+        elevation_matrix,
+        zscale = 10,
+        solid = F,
+        shadow = F,
+        windowsize = c(
+            w / 5, h / 5
+        ),
+        zoom = .515,
+        phi = 85,
+        theta = 0
+    )
+
+rayshader::render_camera(
+    phi = 89,
+    zoom = .675,
+    theta = 0
+)
+
+# 9. RENDER OBJECT
+#-----------------
+
+u <- "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/4k/limpopo_golf_course_4k.hdr"
+
+download.file(
+    url = u,
+    destfile = basename(u),
+    mode = "wb"
+)
+
+rayshader::render_highquality(
+    filename = "california-3d-river-basins.png",
+    preview = T,
+    light = F,
+    environment_light = basename(u),
+    rotate_env = 0,
+    intensity_env = .85,
+    ground_material = rayrender::diffuse(
+        color = "grey10"
+    ),
+    interactive = F,
+    parallel = T,
+    width = w,
+    height = h
+)
